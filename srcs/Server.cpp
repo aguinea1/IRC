@@ -1,451 +1,579 @@
-/*
- * Server.cpp - versión comentada y explicada
- * Estándar: C++98 (gnuc++98)
- * Propósito: implementación básica de un servidor IRC (solo servidor)
- * Comentarios detallados añadidos para cada bloque de funcionalidad.
- *
- * Notas rápidas:
- *  - Esta versión asume sockets en modo no bloqueante (O_NONBLOCK).
- *  - Usa select() para monitorizar lecturas. Para robustez en envío, convendría
- *    añadir también monitorización de escrituras (writefds) para vaciar buffer_out.
- *  - El parsing de comandos es deliberadamente simple; para cumplir RFC/ft_irc
- *    necesitarás aumentar la validación y respuestas numéricas.
- */
-
 #include "Server.hpp"
-#include <cstdio>    // perror
-#include <cstdlib>   // exit, EXIT_FAILURE
-#include <cerrno>    // errno
-#include <cstring>   // memset, strerror
-#include <unistd.h>  // close, read, write
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 #include <iostream>
-#include <fcntl.h>   // fcntl
 
-// Constructor: guarda puerto y password, inicializa listen socket a -1
-Server::Server(int port, const std::string &password)
-    : _port(port), _password(password), _listenSocket(-1) {}
+//protocolo IRC:
+//Conexion TCP
+// cliente--servidor: el cliente tiene q abrir un socket, se conecta al servidor(puerto e IP), y el servidor lo guarda en lista de clientes(_clients)
+// a partir de ahi el cliente ya puede usar comandos del protocolo IRC(JOIN, PART etc...)
+// cada cliente cuenta con su socket y dos buffers(datos, del cliente, datos q el server le quiere enviar)
+//formato irc:[:prefix] COMMAND [param1] [param2] ... [:último parámetro con espacios], (:juan!j@localhost PRIVMSG #chat :Hola a todos)
+// -------------------- utilidades de socket --------------------
 
-// Destructor: cierra socket de escucha si existe y libera memoria de clientes
-Server::~Server() {
-    if (_listenSocket != -1)
-        close(_listenSocket);
-
-    // Liberar objetos Client almacenados en el mapa
-    for (std::map<int, Client*>::iterator it = _clients_fd.begin(); it != _clients_fd.end(); ++it)
-        delete it->second;
+Server::Server(int port, const std::string& password)
+: _listenFd(-1), _port(port), _password(password) {
+    std::cout <<"Abriendo server"<< std::endl;
+    setupListen();
 }
 
-// setNonBlocking: activa O_NONBLOCK en el file descriptor dado
-// - Utilizamos fcntl para no bloquear llamadas a recv/send/accept
-// - En MacOS el enunciado permite fcntl(fd, F_SETFL, O_NONBLOCK)
+Server::~Server() {
+    // cierra clientes
+    std::map<int, Client*>::iterator it = _clients.begin();
+    for (; it != _clients.end(); ++it) {
+        delete it->second;
+    }
+    _clients.clear();
+    if (_listenFd >= 0) {
+        ::close(_listenFd);
+        _listenFd = -1;
+    }
+}
+//Non-blcking = para que no se quede esperando el socket del primer cliente y atienda a los de despues(sino se queda bloqueando esperando al primero)
 void Server::setNonBlocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) flags = 0; // si falla, asumimos 0
+    if (flags < 0) flags = 0;
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    std::cout<<"[SERVER] Non-Blocking done"<< std::endl;
 }
 
-// init: crea el socket de escucha, lo deja en non-blocking, bind y listen
-// - setsockopt(SO_REUSEADDR) para poder reutilizar el puerto rápidamente
-// - se sale con EXIT_FAILURE en caso de error (puedes cambiar por excepciones)
-void Server::init() {
-    _listenSocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (_listenSocket < 0) {
-        perror("socket");
-        exit(EXIT_FAILURE);
-    }
+void Server::setupListen() {
+    _listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (_listenFd < 0) throw std::runtime_error("socket() failed");
 
     int opt = 1;
-    if (setsockopt(_listenSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
-        perror("setsockopt");
-        close(_listenSocket);
-        exit(EXIT_FAILURE);
+    setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(static_cast<uint16_t>(_port));
+
+    if (::bind(_listenFd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+        ::close(_listenFd);
+        throw std::runtime_error("bind() failed");
     }
-
-    // Poner el socket de escucha en modo no bloqueante
-    setNonBlocking(_listenSocket);
-
-    sockaddr_in servAddr;
-    memset(&servAddr, 0, sizeof(servAddr));
-    servAddr.sin_family = AF_INET;
-    servAddr.sin_addr.s_addr = INADDR_ANY; // escuchar en todas las interfaces
-    servAddr.sin_port = htons(_port);
-
-    if (bind(_listenSocket, (struct sockaddr*)&servAddr, sizeof(servAddr)) < 0) {
-        perror("bind");
-        close(_listenSocket);
-        exit(EXIT_FAILURE);
+    if (::listen(_listenFd, 128) < 0) {
+        ::close(_listenFd);
+        throw std::runtime_error("listen() failed");
     }
-
-    if (listen(_listenSocket, 10) < 0) {
-        perror("listen");
-        close(_listenSocket);
-        exit(EXIT_FAILURE);
-    }
-
-    std::cout << "Servidor escuchando en puerto " << _port
-              << " con password: " << _password << std::endl;
+    //std::cout <<"setup Listen hecho "<< std::endl;
+    setNonBlocking(_listenFd);
 }
 
-// addClient: aceptar un nuevo cliente (ya obtenido por accept en run())
-// - marca el socket como non-blocking
-// - crea un objeto Client y lo añade al mapa _clients_fd
-void Server::addClient(int fd) {
-    setNonBlocking(fd); // cliente también en non-blocking
-    Client* client = new Client(fd);
-    _clients_fd[fd] = client;
-    std::cout << "Cliente agregado con fd: " << fd << std::endl;
+void Server::acceptNewClient() {//implementar connect()
+    sockaddr_in cliaddr;
+    socklen_t len = sizeof(cliaddr);
+    int cfd = ::accept(_listenFd, (sockaddr*)&cliaddr, &len);//creacion de socket para el nuevo cliente(cfd = canal de comunicacion)
+    if (cfd < 0) return;
+    setNonBlocking(cfd);
+
+    char buf[64];
+    std::memset(buf, 0, sizeof(buf));
+    const char* ip = inet_ntop(AF_INET, &cliaddr.sin_addr, buf, sizeof(buf)-1);
+    std::string host = ip ? std::string(ip) : std::string("localhost");//ip binaria en legible (1010101001 a 127.0.0.1 o localhost)
+
+    Client* c = new Client(cfd, host);
+    _clients[cfd] = c;
+    _cstate[cfd] = ClientState();
+    // setear booleanos de clientstate(all false)
+    std::cout <<"[CLIENT] client accepted"<<std::endl; 
+    std::cout <<" [USAGE for CLIENTS]\n 1. PASS <password>\n 2. NICK <nickname>\n 3. USER <username> <hostname> <servername> :<realname>"<< std::endl;
 }
 
-// removeClient: limpiar todo lo asociado a un cliente
-// Pasos:
-//  1) borrar entrada de nick en _clients_nick si la tenía
-//  2) remover el cliente de todos los canales en _channels
-//  3) cerrar el fd y borrar el objeto Client
-//  4) borrar la entrada en _clients_fd
-// Nota: esta función puede ser llamada desde el loop de select, por lo que
-//       hacemos una búsqueda por fd y borramos con cuidado para no invalidar iteradores externos.
-void Server::removeClient(int fd) {
-    std::map<int, Client*>::iterator it = _clients_fd.find(fd);
-    if (it != _clients_fd.end()) {
-        Client* client = it->second;
+// -------------------- bucle principal --------------------
 
-        // eliminar de mapa por nick si existía
-        if (!client->nick.empty()) {
-            _clients_nick.erase(client->nick);
-        }
-
-        // quitar de todos los canales (recorremos todos los canales)
-        for (std::map<std::string, std::vector<Client*> >::iterator cit = _channels.begin();
-             cit != _channels.end(); ++cit) {
-            std::vector<Client*>& v = cit->second;
-            for (std::vector<Client*>::iterator vit = v.begin(); vit != v.end(); ++vit) {
-                if ((*vit) == client) {
-                    v.erase(vit);
-                    break; // salir del vector de este canal
-                }
-            }
-        }
-
-        if (client->fd != -1) {
-            close(client->fd);
-        }
-        delete client; // liberar memoria
-        _clients_fd.erase(it);
-
-        std::cout << "Cliente con fd " << fd << " eliminado." << std::endl;
-    }
-}
-
-// sendToClient: añade el mensaje al buffer de salida y trata de enviarlo inmediatamente
-// - En sockets non-blocking send() puede devolver < tamaño pedido (envío parcial)
-// - Si send devuelve -1 con errno == EWOULDBLOCK/EAGAIN, debemos mantener el resto en buffer_out
-// - Mejora recomendada: usar writefds en select() para saber cuándo el socket es escribible
-void Server::sendToClient(Client *client, const std::string &msg) {
-    if (!client) return;
-    // Guardamos en buffer de salida (por si send() no puede enviar todo ahora)
-    client->buffer_out += msg;
-    if (!client->buffer_out.empty()) {
-        // Intentamos enviar todo lo que haya en buffer_out
-        ssize_t sent = send(client->fd, client->buffer_out.c_str(), client->buffer_out.size(), 0);
-        if (sent > 0) {
-            // borrar bytes enviados
-            client->buffer_out.erase(0, sent);
-        }
-        // Si sent < 0 y errno == EWOULDBLOCK/EAGAIN -> lo dejamos en buffer_out para reintentar
-        // Si sent < 0 y errno != EWOULDBLOCK/EAGAIN -> deberíamos cerrar la conexión (no tratado aquí)
-    }
-}
-
-// broadcastToChannel: envía msg a todos los clientes del canal excepto (opcional) el cliente 'except'
-// - El método usa sendToClient() por lo que el envío puede quedar en buffer_out
-void Server::broadcastToChannel(const std::string &channel, const std::string &msg, Client *except) {
-    std::map<std::string, std::vector<Client*> >::iterator it = _channels.find(channel);
-    if (it == _channels.end()) return; // canal desconocido
-    std::vector<Client*>& clients = it->second;
-    for (size_t i = 0; i < clients.size(); ++i) {
-        Client *c = clients[i];
-        if (except && c->fd == except->fd) continue; // no reenviar al emisor
-        sendToClient(c, msg);
-    }
-}
-
-// joinChannel: añade un cliente a un canal (crea el vector si no existe)
-// - Evita duplicados
-// - Envía una notificación JOIN al canal (opcional)
-void Server::joinChannel(const std::string &channel, Client *client) {
-    std::vector<Client*>& vec = _channels[channel];
-    // evitar duplicados
-    for (size_t i = 0; i < vec.size(); ++i)
-        if (vec[i] == client) return;
-    vec.push_back(client);
-
-    // notificar a canal que se ha unido (formato simple)
-    std::string notice = ":" + client->nick + " JOIN " + channel + "\r\n";
-    broadcastToChannel(channel, notice, client);
-}
-
-// partChannel: elimina cliente del canal y notifica
-void Server::partChannel(const std::string &channel, Client *client) {
-    std::map<std::string, std::vector<Client*> >::iterator it = _channels.find(channel);
-    if (it == _channels.end()) return;
-    std::vector<Client*>& vec = it->second;
-    for (std::vector<Client*>::iterator vit = vec.begin(); vit != vec.end(); ++vit) {
-        if ((*vit) == client) {
-            vec.erase(vit);
-            break;
-        }
-    }
-    std::string notice = ":" + client->nick + " PART " + channel + "\r\n";
-    broadcastToChannel(channel, notice, client);
-}
-
-// processLine: procesa una línea completa proveniente del cliente
-// - El parsing es intencionalmente sencillo. Implementa NICK, USER, JOIN, PRIVMSG, QUIT.
-// - La implementación sirve como base funcional.
-void Server::processLine(Client *client, const std::string &line) {
-    if (!client) return;
-    if (line.empty()) return;
-
-    // Tokenizar comando simple: separa primer token (cmd) del resto (rest)
-    std::string cmd;
-    std::string rest;
-    size_t pos = line.find(' ');
-    if (pos == std::string::npos) {
-        cmd = line;
-    } else {
-        cmd = line.substr(0, pos);
-        rest = line.substr(pos + 1);
-    }
-
-    // convertir cmd a mayúsculas para comparación sin case-sensitivity
-    for (size_t i = 0; i < cmd.size(); ++i) cmd[i] = toupper(cmd[i]);
-
-    if (cmd == "NICK") {
-        // NICK <newnick>
-        std::string newnick = rest;
-        // recortar espacios a la izquierda
-        if (!newnick.empty() && newnick[0] == ' ') newnick.erase(0, newnick.find_first_not_of(' '));
-        // si hay parámetros adicionales, nos quedamos con el primero
-        size_t sp = newnick.find(' ');
-        if (sp != std::string::npos) newnick = newnick.substr(0, sp);
-
-        if (newnick.empty()) {
-            sendToClient(client, "431 :No nickname given\r\n");
-            return;
-        }
-        if (_clients_nick.find(newnick) != _clients_nick.end()) {
-            sendToClient(client, "433 " + newnick + " :Nickname is already in use\r\n");
-            return;
-        }
-        // borrar antiguo nick si existía
-        if (!client->nick.empty()) {
-            _clients_nick.erase(client->nick);
-        }
-        client->nick = newnick;
-        _clients_nick[newnick] = client;
-        // si ya tenemos USER, marcamos registered y enviamos 001 Welcome (simplificado)
-        if (!client->username.empty()) {
-            client->registered = true;
-            sendToClient(client, ":server 001 " + client->nick + " :Welcome\r\n");
-        }
-        return;
-    } else if (cmd == "USER") {
-        // USER <username> <hostname> <servername> :<realname>
-        // Implementación simplificada: tomamos el primer token como username
-        std::string username = rest;
-        if (!username.empty() && username[0] == ' ') username.erase(0, username.find_first_not_of(' '));
-        size_t sp = username.find(' ');
-        if (sp != std::string::npos) username = username.substr(0, sp);
-        client->username = username;
-        if (!client->nick.empty()) {
-            client->registered = true;
-            sendToClient(client, ":server 001 " + client->nick + " :Welcome\r\n");
-        }
-        return;
-    } else if (cmd == "JOIN") {
-        // JOIN <channel>
-        std::string channel = rest;
-        if (!channel.empty() && channel[0] == ' ') channel.erase(0, channel.find_first_not_of(' '));
-        // tomamos solo primer token
-        size_t p = channel.find(' ');
-        if (p != std::string::npos) channel = channel.substr(0, p);
-        if (channel.empty()) {
-            // 461 = ERR_NEEDMOREPARAMS
-            sendToClient(client, "461 JOIN :Not enough parameters\r\n");
-            return;
-        }
-        joinChannel(channel, client);
-        // Aquí podríamos enviar RPL_TOPIC / RPL_NAMREPLY etc.
-        return;
-    } else if (cmd == "PRIVMSG") {
-        // PRIVMSG <target> :<message>
-        std::string target;
-        std::string msgtext;
-        size_t s = rest.find(' ');
-        if (s == std::string::npos) {
-            // 411 = ERR_NORECIPIENT
-            sendToClient(client, "411 :No recipient given\r\n");
-            return;
-        } else {
-            target = rest.substr(0, s);
-            msgtext = rest.substr(s + 1);
-            // recortar espacios iniciales de msgtext
-            if (!msgtext.empty() && msgtext[0] == ' ')
-                msgtext.erase(0, msgtext.find_first_not_of(' '));
-            // si comienza por ':' quitarlo (parámetro final según RFC)
-            if (!msgtext.empty() && msgtext[0] == ':')
-                msgtext.erase(0, 1);
-        }
-
-        // Formato de origen simple: :nick!user@host PRIVMSG target :message\r\n
-        std::string origin = client->nick.empty() ? "unknown" : client->nick;
-        std::string user = client->username.empty() ? "user" : client->username;
-        std::string host = "localhost"; // podríamos obtener el host real usando getpeername/inet_ntoa
-        std::string full = ":" + origin + "!" + user + "@" + host + " PRIVMSG " + target + " :" + msgtext + "\r\n";
-
-        // Si target es un canal (aquí consideramos '#' como prefijo de canal)
-        if (!target.empty() && target[0] == '#') {
-            broadcastToChannel(target, full, client);
-        } else {
-            // mensaje directo a nick
-            std::map<std::string, Client*>::iterator cit = _clients_nick.find(target);
-            if (cit == _clients_nick.end()) {
-                // 401 = ERR_NOSUCHNICK
-                sendToClient(client, "401 " + target + " :No such nick/channel\r\n");
-            } else {
-                sendToClient(cit->second, full);
-            }
-        }
-        return;
-    } else if (cmd == "QUIT") {
-        // Cliente desconectándose voluntariamente
-        removeClient(client->fd);
-        return;
-    } else {
-        // Comando desconocido -> 421 ERR_UNKNOWNCOMMAND
-        sendToClient(client, "421 " + cmd + " :Unknown command\r\n");
-        return;
-    }
-}
-
-// handleClientReadable: lee datos del socket del cliente (non-blocking) y los acumula
-// en client->buffer_in. Cuando encuentra líneas completas (terminadas en CRLF o LF)
-// llama a processLine() por cada línea.
-void Server::handleClientReadable(int fd) {
-    std::map<int, Client*>::iterator it = _clients_fd.find(fd);
-    if (it == _clients_fd.end()) return;
-    Client* client = it->second;
-
-    // buffer temporal para leer bytes disponibles
-    char buf[512];
-    ssize_t bytes = recv(fd, buf, sizeof(buf) - 1, 0);
-    if (bytes <= 0) {
-        // bytes == 0 -> cierre por parte del cliente
-        // bytes < 0 y errno != EWOULDBLOCK/EAGAIN -> error real
-        if (bytes == 0 || (bytes < 0 && errno != EWOULDBLOCK && errno != EAGAIN)) {
-            std::cout << "Cliente desconectado: "
-                      << (client->nick.empty() ? "unknown" : client->nick)
-                      << std::endl;
-            removeClient(fd);
-        }
-        return;
-    }
-    buf[bytes] = '\0';
-    // append al buffer de entrada del cliente (soporta reads parciales)
-    client->buffer_in.append(buf, bytes);
-
-    // procesar todas las líneas completas (CRLF o LF)
-    size_t pos;
-    while ((pos = client->buffer_in.find("\r\n")) != std::string::npos ||
-           (pos = client->buffer_in.find("\n")) != std::string::npos) {
-        size_t len = pos;
-        std::string line = client->buffer_in.substr(0, len);
-        // borrar línea + terminador(s)
-        if (client->buffer_in.size() > pos + 2 && client->buffer_in[pos] == '\r' && client->buffer_in[pos+1] == '\n')
-            client->buffer_in.erase(0, pos + 2);
-        else if (client->buffer_in.size() > pos + 1 && client->buffer_in[pos] == '\n')
-            client->buffer_in.erase(0, pos + 1);
-        else
-            client->buffer_in.erase(0, pos + 1);
-
-        // procesar el comando/linea completa
-        processLine(client, line);
-    }
-}
-
-// run: loop principal que usa select() para monitorizar nuevas conexiones y lecturas
-// - Sólo se usa un fd_set readfds (requisito del enunciado que permite select() o poll())
-// - Recomendado: añadir writefds para enviar buffer_out pendiente
-void Server::run() {
-    fd_set readfds;
-    int max_fd;
-
-    while (true) {
+void Server::run(bool &running) {
+    std::cout << "[SERVER] Listening on port... " << _port << std::endl;
+    while (running) {
+        fd_set readfds;
+        fd_set writefds;
         FD_ZERO(&readfds);
-        FD_SET(_listenSocket, &readfds);
-        max_fd = _listenSocket;
+        FD_ZERO(&writefds);
 
-        // Añadir todos los fds de clientes al conjunto
-        for (std::map<int, Client*>::iterator it = _clients_fd.begin(); it != _clients_fd.end(); ++it) {
+        int maxfd = _listenFd;
+        FD_SET(_listenFd, &readfds);
+
+        // prepara sets para clientes
+        std::map<int, Client*>::iterator it = _clients.begin();
+        for (; it != _clients.end(); ++it) {
+            std::cout<<"[SERVER] Looking clients data"<<std::endl;
             int fd = it->first;
-            FD_SET(fd, &readfds);
-            if (fd > max_fd) max_fd = fd;
+            FD_SET(fd, &readfds); //para saber si el cliente tiene nuevos datos que leer(en el fd se ha escrito algo)
+            if (!it->second->buffer_out.empty()) {//si esta vacio no hay que enviar nada mas al cliente
+                FD_SET(fd, &writefds);
+            }
+            if (fd > maxfd) maxfd = fd;//setea el mas grande para luego
         }
 
-        // select bloqueante hasta que haya actividad
-        int activity = select(max_fd + 1, &readfds, NULL, NULL, NULL);
-        if (activity < 0) {
-            if (errno == EINTR) continue; // señal interrumpió select, reintentar
-            perror("select");
+        int ret = ::select(maxfd + 1, &readfds, &writefds, NULL, NULL);
+        //ret >0 = fd listo
+        if (ret < 0) {
+            std::cout<<"[SERVER] invalid fd"<<std::endl;
+            if (errno == EINTR) continue;
+            std::perror("select");
             break;
         }
 
-        // nueva conexión entrante
-        if (FD_ISSET(_listenSocket, &readfds)) {
-            struct sockaddr_in clientAddr;
-            socklen_t addrlen = sizeof(clientAddr);
-            int new_fd = accept(_listenSocket, (struct sockaddr*)&clientAddr, &addrlen);
-            if (new_fd < 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue; // no hay conexiones pendientes
-                perror("accept");
-            } else {
-                addClient(new_fd);
-                std::cout << "Nueva conexión desde "
-                          << inet_ntoa(clientAddr.sin_addr)
-                          << ":" << ntohs(clientAddr.sin_port) << std::endl;
-            }
+        if (FD_ISSET(_listenFd, &readfds)) {
+            std::cout <<"[SERVER] new client"<<std::endl;
+            acceptNewClient();
         }
 
-        // mensajes de clientes existentes
-        // Para evitar invalidación de iteradores por removeClient(), copiamos los fds a un vector
-        std::vector<int> fds;
-        for (std::map<int, Client*>::iterator it = _clients_fd.begin(); it != _clients_fd.end(); ++it)
-            fds.push_back(it->first);
-
-        for (size_t i = 0; i < fds.size(); ++i) {
-            int fd = fds[i];
+        // gestionar clientes: cuidado con borrados durante el loop
+        it = _clients.begin();
+        while (it != _clients.end()) {
+            std::map<int, Client*>::iterator cur = it++;
+            int fd = cur->first;
+            std::cout <<"[CLIENT] client fd: "<<fd<< std::endl;
             if (FD_ISSET(fd, &readfds)) {
-                // handle read
+                std::cout <<"[SERVER] data to be readen on socket"<<std::endl;
                 handleClientReadable(fd);
             }
+            // para escribir output del cliente
+            if (_clients.find(fd) != _clients.end() && FD_ISSET(fd, &writefds)) {
+                flushClientOutput(fd);
+            }
+        }
+    }
+
+    std::cout << "\n[SERVER] Turning off all conections..." << std::endl;
+    for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+        close(it->first);
+        delete it->second;
+         _clients.clear();
+    close(_listenFd);
+    std::cout << "[SERVER] Turned off." << std::endl;
+    }
+}
+
+// -------------------- lectura y escritura --------------------
+
+void Server::handleClientReadable(int fd) {
+    std::map<int, Client*>::iterator it = _clients.find(fd);
+    if (it == _clients.end()) return;
+    Client* c = it->second;
+
+    char buf[4096];
+    while (true) {
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);//recv: lee lo q haya en el socket
+        if (n > 0) {//si hay datos
+            c->buffer_in.append(buf, static_cast<size_t>(n));//getnexline
+            if (c->buffer_in.size() > 65536) {//intento de overflow
+                removeClient(fd);
+                return;
+            }
+        } else if (n == 0) {//QUIT
+            // peer closed
+            removeClient(fd);
+            return;
+        } else {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {//no hay mas datos ahora
+                break;
+            } else {
+                removeClient(fd);
+                return;
+            }
+        }
+    }
+
+    // procesar líneas completas por \r\n o \n
+    while (true) {//getnextline (lyendo por lineas)
+        std::string::size_type pos = c->buffer_in.find('\n');
+        if (pos == std::string::npos) break;
+
+        // extrae línea
+        std::string line = c->buffer_in.substr(0, pos + 1);
+        c->buffer_in.erase(0, pos + 1);
+
+        processLine(c, line);
+        if (_clients.find(fd) == _clients.end()) return; // pudo desconectar
+    }
+}
+
+void Server::flushClientOutput(int fd) {
+    std::map<int, Client*>::iterator it = _clients.find(fd);
+    if (it == _clients.end()) return;
+    Client* c = it->second;
+
+    while (!c->buffer_out.empty()) {
+        ssize_t n = ::send(fd, c->buffer_out.data(), c->buffer_out.size(), 0);
+        if (n > 0) {
+            c->buffer_out.erase(0, static_cast<size_t>(n));
+        } else {
+            if (errno == EWOULDBLOCK || errno == EAGAIN) {
+                return; // ya enviaremos en el siguiente ciclo
+            } else {
+                removeClient(fd);
+                return;
+            }
         }
     }
 }
 
-/*
- * Sugerencias / mejoras (resumen):
- *  - Añadir manejo de PASS (autenticación con la contraseña _password) antes de permitir USER/NICK/join.
- *  - Implementar writefds en select() para vaciar buffer_out cuando los sockets sean escribibles.
- *  - Robustecer parsing: manejar parámetros que contengan espacios correctamente según RFC (parámetro final ':').
- *  - Validaciones: límites de longitud en nicks, nombres de canal, protección contra líneas demasiado largas.
- *  - Responder con códigos numéricos RFC correctos (RPL_NAMREPLY, RPL_TOPIC, ERR_* más descriptivos).
- *  - Manejar señales y shutdown ordenado (SIGINT) cerrando clientes y liberando recursos.
- *  - Evitar DoS: limitar número de conexiones por IP, rate limiting, timeouts de inactividad.
- *
- * Compilación recomendada (ejemplo):
- *  g++ -Wall -Wextra -Werror -std=gnu++98 Server.cpp Client.cpp main.cpp -o ircserv
- */
+// -------------------- alta/baja cliente --------------------
+
+void Server::removeClient(int fd) {
+    std::map<int, Client*>::iterator it = _clients.find(fd);
+    if (it == _clients.end()) return;
+    Client* c = it->second;
+
+    // salir de canales
+    std::map<std::string, Channel>::iterator ch = _channels.begin();
+    for (; ch != _channels.end(); ++ch) {
+        if (ch->second.members.count(fd)) {
+            ch->second.members.erase(fd);
+            ch->second.ops.erase(fd);
+            ch->second.invited.erase(fd);
+            // avisar salida (opcional)
+            // no enviamos aquí; socket puede estar muriendo
+        }
+    }
+
+    if (!c->nick.empty()) _nicks.erase(c->nick);
+    _cstate.erase(fd);
+   std::cout << "[CLIENT] client: " << (!c->nick.empty() ? c->nick : "unknown") << " is out." << std::endl;
+    delete c;
+    _clients.erase(it);
+}
+
+// -------------------- helpers de protocolo --------------------
+
+Server::Parsed Server::parseLine(const std::string& lineIn) {
+    Parsed p;
+    std::string s = lineIn;
+
+    // quitar fin de línea
+    if (!s.empty() && s[s.size()-1] == '\n') s.erase(s.size()-1);
+    if (!s.empty() && s[s.size()-1] == '\r') s.erase(s.size()-1);
+
+    // saltar espacios iniciales
+    std::string::size_type pos = 0;
+    while (pos < s.size() && s[pos] == ' ') ++pos;
+
+    // comando
+    std::string::size_type start = pos;
+    while (pos < s.size() && s[pos] != ' ') ++pos;
+    p.cmd = s.substr(start, pos - start);
+    for (size_t i = 0; i < p.cmd.size(); ++i)
+        p.cmd[i] = static_cast<char>(std::toupper(p.cmd[i]));
+
+    // parámetros
+    while (pos < s.size()) {
+        while (pos < s.size() && s[pos] == ' ') ++pos;
+        if (pos >= s.size()) break;
+        if (s[pos] == ':') {
+            p.params.push_back(s.substr(pos + 1));
+            break;
+        }
+        start = pos;
+        while (pos < s.size() && s[pos] != ' ') ++pos;
+        p.params.push_back(s.substr(start, pos - start));
+    }
+    return p;
+}
+
+std::string Server::serverPrefix() const {
+    // Puedes poner hostname real si lo resuelves
+    return ":" + std::string("irc.local");
+}
+
+void Server::sendToClient(Client* c, const std::string& msg) {
+    if (!c) return;
+    // asegura CRLF
+    if (msg.size() >= 2 && msg[msg.size()-2] == '\r' && msg[msg.size()-1] == '\n')
+        c->buffer_out += msg;
+    else
+        c->buffer_out += msg + "\r\n";
+}
+
+void Server::sendNumeric(Client* c, const std::string& code, const std::string& args) {
+    std::string nick = c->nick.empty() ? "*" : c->nick;
+    sendToClient(c, serverPrefix() + " " + code + " " + nick + " " + args);
+}
+
+bool Server::isChannel(const std::string& s) const {
+    return !s.empty() && s[0] == '#';
+}
+
+bool Server::requireRegistered(Client* c) {
+    ClientState &st = _cstate[c->fd];
+    if (!st.registered) {
+        sendNumeric(c, "451", ":You have not registered");
+        return false;
+    }
+    return true;
+}
+
+bool Server::tryFinishRegistration(Client* c) {
+    ClientState &st = _cstate[c->fd];
+    if (!st.registered && st.pass_ok && st.has_nick && st.has_user) {
+        st.registered = true;
+        sendNumeric(c, "001", ":Welcome to the IRC server " + c->nick);
+        return true;
+    }
+    return false;
+}
+
+// -------------------- dispatcher de comandos --------------------
+
+void Server::processLine(Client* c, const std::string& line) {
+    Parsed p = parseLine(line);
+    std::cout << p.cmd<< std::endl;
+    if (p.cmd.empty()) return;
+
+    if (p.cmd == "PASS") { std::cout<<p.cmd<<std::endl; cmdPASS(c, p.params); return; }
+    if (p.cmd == "NICK") { std::cout<<p.cmd<<std::endl; cmdNICK(c, p.params); return; }
+    if (p.cmd == "USER") { std::cout<<p.cmd<<std::endl; cmdUSER(c, p.params); return; }
+    if (p.cmd == "JOIN") { std::cout<<p.cmd<<std::endl; cmdJOIN(c, p.params); return; }
+    if (p.cmd == "PRIVMSG") { std::cout<<p.cmd<<std::endl; cmdPRIVMSG(c, p.params); return; }
+    if (p.cmd == "QUIT") { std::cout<<p.cmd<<std::endl; cmdQUIT(c, p.params); return; }
+    if (p.cmd == "MODE") { std::cout<<p.cmd<<std::endl; cmdMODE(c, p.params); return; } 
+
+    // Comando desconocido
+    sendNumeric(c, "421", p.cmd + " :Unknown command");
+}
+
+// -------------------- implementación de comandos --------------------
+
+void Server::cmdPASS(Client* c, const std::vector<std::string>& params) {
+    ClientState &st = _cstate[c->fd];
+    if (st.registered) {
+        sendNumeric(c, "462", ":You may not reregister");
+        return;
+    }
+    if (params.empty()) {
+        sendNumeric(c, "461", "PASS :Not enough parameters");
+        return;
+    }
+    if (params[0] == _password) {
+        std::cout<<"correct pass"<<std::endl;
+        st.pass_ok = true;
+    } else {
+        sendNumeric(c, "464", ":Password incorrect");
+        // removeClient(c->fd);
+    }
+    tryFinishRegistration(c);
+}
+
+void Server::cmdNICK(Client* c, const std::vector<std::string>& params) {
+    if (params.empty() || params[0].empty()) {
+        sendNumeric(c, "431", ":No nickname given");
+        return;
+    }
+    std::string newnick = params[0];
+    if (_nicks.count(newnick) && _nicks[newnick] != c->fd) {
+        sendNumeric(c, "433", newnick + " :Nickname is already in use");
+        return;
+    }
+
+    // actualizar mapa de nicks
+    if (!c->nick.empty()) _nicks.erase(c->nick);
+    c->nick = newnick;
+    _nicks[newnick] = c->fd;
+
+    _cstate[c->fd].has_nick = true;
+    tryFinishRegistration(c);
+}
+
+void Server::cmdUSER(Client* c, const std::vector<std::string>& params) {
+    ClientState &st = _cstate[c->fd];
+    if (st.has_user) {
+        sendNumeric(c, "462", ":You may not reregister");
+        return;
+    }
+    if (params.size() < 4) {
+        sendNumeric(c, "461", "USER :Not enough parameters");
+        return;
+    }
+    c->username = params[0];
+    c->realname = params[3]; // trailing
+    st.has_user = true;
+    tryFinishRegistration(c);
+}
+
+void Server::joinChannel(const std::string& name, Client* c) {
+    std::string chan = name;
+    if (!isChannel(chan)) chan = "#" + chan;
+
+    Channel &ch = _channels[chan];
+    ch.name = chan;
+
+    // +i: sólo invitados u operators
+    if (ch.inviteOnly && ch.invited.count(c->fd) == 0 && ch.ops.count(c->fd) == 0) {
+        sendNumeric(c, "473", chan + " :Cannot join channel (+i)");
+        return;
+    }
+
+    // límite (si implementas +l)
+    if (ch.userLimit >= 0 && static_cast<int>(ch.members.size()) >= ch.userLimit) {
+        sendNumeric(c, "471", chan + " :Cannot join channel (+l)");
+        return;
+    }
+
+    // clave (si implementas +k): comprobar aquí
+
+    bool first = ch.members.empty();
+    ch.members.insert(c->fd);
+    if (first) ch.ops.insert(c->fd); // primer usuario operador
+
+    // notifica JOIN
+    std::string prefix = ":" + (c->nick.empty() ? "*" : c->nick) + "!" +
+                         (c->username.empty() ? "user" : c->username) + "@" + c->host;
+    broadcastToChannel(chan, prefix + " JOIN " + chan, NULL);
+
+    // topic si hay
+    if (!ch.topic.empty())
+        sendNumeric(c, "332", c->nick + " " + chan + " :" + ch.topic);
+
+    // NAMES
+    std::string names;
+    std::set<int>::iterator it = ch.members.begin();
+    for (; it != ch.members.end(); ++it) {
+        Client* m = _clients[*it];
+        bool isop = ch.ops.count(*it) != 0;
+        if (m) {
+            if (!names.empty()) names += " ";
+            names += (isop ? "@" : "") + (m->nick.empty() ? "*" : m->nick);
+        }
+    }
+    sendNumeric(c, "353", "= " + chan + " :" + names);
+    sendNumeric(c, "366", chan + " :End of /NAMES list");
+}
+
+void Server::cmdJOIN(Client* c, const std::vector<std::string>& params) {
+    if (!requireRegistered(c)) return;
+    if (params.empty()) {
+        sendNumeric(c, "461", "JOIN :Not enough parameters");
+        return;
+    }
+    // soporta JOIN #a,#b
+    std::string list = params[0];
+    std::string cur;
+    for (size_t i = 0; i <= list.size(); ++i) {
+        if (i == list.size() || list[i] == ',') {
+            if (!cur.empty()) joinChannel(cur, c);
+            cur.clear();
+        } else {
+            cur += list[i];
+        }
+    }
+}
+
+void Server::broadcastToChannel(const std::string& chan, const std::string& msg, Client* except) {
+    std::map<std::string, Channel>::iterator it = _channels.find(chan);
+    if (it == _channels.end()) return;
+    Channel& ch = it->second;
+
+    std::set<int>::iterator m = ch.members.begin();
+    for (; m != ch.members.end(); ++m) {
+        if (except && *m == except->fd) continue;
+        std::map<int, Client*>::iterator cit = _clients.find(*m);
+        if (cit != _clients.end()) {
+            sendToClient(cit->second, msg);
+        }
+    }
+}
+
+void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params) {
+    if (!requireRegistered(c)) return;
+    if (params.size() < 2) {
+        sendNumeric(c, "411", ":No recipient given (PRIVMSG)");
+        return;
+    }
+    std::string target = params[0];
+    std::string text   = params[1]; // ya soporta trailing con espacios
+
+    std::string prefix = ":" + (c->nick.empty() ? "*" : c->nick) + "!" +
+                         (c->username.empty() ? "user" : c->username) + "@" + c->host;
+
+    if (isChannel(target)) {
+        std::map<std::string, Channel>::iterator it = _channels.find(target);
+        if (it == _channels.end()) {
+            sendNumeric(c, "403", target + " :No such channel");
+            return;
+        }
+        // envía a todos menos al emisor
+        broadcastToChannel(target, prefix + " PRIVMSG " + target + " :" + text, c);
+    } else {
+        // a usuario
+        std::map<std::string, int>::iterator nt = _nicks.find(target);
+        if (nt == _nicks.end()) {
+            sendNumeric(c, "401", target + " :No such nick");
+            return;
+        }
+        std::map<int, Client*>::iterator dest = _clients.find(nt->second);
+        if (dest != _clients.end()) {
+            sendToClient(dest->second, prefix + " PRIVMSG " + target + " :" + text);
+        }
+    }
+}
+
+void Server::cmdQUIT(Client* c, const std::vector<std::string>& params) {
+    std::string msg = (params.empty() ? "Client Quit" : params[0]);
+
+    // notificar a canales
+    std::map<std::string, Channel>::iterator ch = _channels.begin();
+    for (; ch != _channels.end(); ++ch) {
+        if (ch->second.members.count(c->fd)) {
+            std::string prefix = ":" + (c->nick.empty() ? "*" : c->nick) + "!" +
+                                 (c->username.empty() ? "user" : c->username) + "@" + c->host;
+            broadcastToChannel(ch->first, prefix + " QUIT :" + msg, c);
+        }
+    }
+    removeClient(c->fd);
+}
+
+void Server::cmdMODE(Client* c, const std::vector<std::string>& params) {
+    if (params.empty()) {
+        sendNumeric(c, "461", "MODE :Not enough parameters");
+        return;
+    }
+    std::string target = params[0];
+
+    // sólo modos de canal para el subject
+    if (!isChannel(target)) {
+        // puedes ignorar o responder mínimo
+        sendNumeric(c, "501", ":Unknown MODE flag");
+        return;
+    }
+
+    Channel &ch = _channels[target];
+    ch.name = target;
+
+    if (params.size() == 1) {
+        // consulta de modos
+        std::string modes = "+";
+        if (ch.inviteOnly) modes += "i";
+        // aquí agregarías k,l,t si están activos, pero basta como ejemplo
+        sendNumeric(c, "324", target + " " + modes);
+        return;
+    }
+
+    // cambiar modos: requiere operador
+    if (ch.ops.count(c->fd) == 0) {
+        sendNumeric(c, "482", target + " :You're not channel operator");
+        return;
+    }
+
+    std::string flags = params[1];
+    int sign = 0; // +1 o -1
+
+    for (size_t i = 0; i < flags.size(); ++i) {
+        char f = flags[i];
+        if (f == '+') { sign = +1; continue; }
+        if (f == '-') { sign = -1; continue; }
+
+        if (f == 'i') {
+            ch.inviteOnly = (sign > 0);
+            std::string prefix = ":" + (c->nick.empty() ? "*" : c->nick) + "!" +
+                                 (c->username.empty() ? "user" : c->username) + "@" + c->host;
+            broadcastToChannel(target, prefix + " MODE " + target + " " + (ch.inviteOnly?"+i":"-i"), NULL);
+        }
+
+        // Aquí extenderías:
+        // 't' -> restringir TOPIC
+        // 'k' -> requiere param para set (+k <key>) / unset (-k)
+        // 'o' -> (+o <nick> / -o <nick>) para operadores
+        // 'l' -> (+l <n> / -l)
+    }
+}
