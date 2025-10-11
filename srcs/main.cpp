@@ -7,7 +7,7 @@ static bool running = true;
 
 static bool validPort(long p) { return p > 0 && p <= 65535; }
 
-static void handleSigint(int) {
+static void handleSigint(int) {//Ctrl + c
     std::cout << "\n[SERVER] SIGINT received, shutting down..." << std::endl;
     running = false;          
 }
@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handleSigint);
 
     try {
-        Server s(static_cast<int>(p), pass);
+        Server s(static_cast<int>(p), pass);//constructor del serve(puerto, password)
         s.run(running);
     } catch (const std::exception& e) {
         std::cerr << "Fatal: " << e.what() << "\n";
