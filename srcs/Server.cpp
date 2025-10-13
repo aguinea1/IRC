@@ -645,8 +645,19 @@ void Server::cmdMODE(Client* c, const std::vector<std::string>& params) {
             }
             
             std::string modes = params[1];
-            // Implementación básica de modos (se puede expandir)
-            sendNumeric(c, "324", target + " " + channel->getModeString());
+            std::string modeParams = (params.size() > 2) ? params[2] : "";
+            
+            if (!processChannelModes(channel, c, modes, modeParams)) {
+                return;
+            }
+            
+            // Enviar confirmación de cambio de modos
+            std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
+            std::string modeMsg = prefix + " MODE " + target + " " + modes;
+            if (!modeParams.empty()) {
+                modeMsg += " " + modeParams;
+            }
+            broadcastToChannel(channel, modeMsg);
         }
     } else {
         // Modos de usuario (no implementado)
@@ -799,4 +810,113 @@ void Server::cmdINVITE(Client* c, const std::vector<std::string>& params) {
     
     std::cout << "[INVITE] " << c->getNick() << " invited " << targetNick 
               << " to " << channelName << std::endl;
+}
+
+// -------------------- procesamiento de modos de canal --------------------
+
+bool Server::processChannelModes(Channel* channel, Client* c, const std::string& modes, const std::string& params) {
+    if (modes.empty()) return true;
+    
+    bool adding = true;
+    size_t paramIndex = 0;
+    std::vector<std::string> paramList;
+    
+    // Dividir parámetros
+    if (!params.empty()) {
+        std::stringstream ss(params);
+        std::string param;
+        while (ss >> param) {
+            paramList.push_back(param);
+        }
+    }
+    
+    for (size_t i = 0; i < modes.length(); ++i) {
+        char mode = modes[i];
+        
+        if (mode == '+') {
+            adding = true;
+            continue;
+        } else if (mode == '-') {
+            adding = false;
+            continue;
+        }
+        
+        switch (mode) {
+            case 'i': // invite-only
+                if (adding) {
+                    channel->setInviteOnly(true);
+                } else {
+                    channel->setInviteOnly(false);
+                }
+                break;
+                
+            case 't': // topic protection
+                if (adding) {
+                    channel->setTopicProtected(true);
+                } else {
+                    channel->setTopicProtected(false);
+                }
+                break;
+                
+            case 'k': // channel key
+                if (adding) {
+                    if (paramIndex >= paramList.size()) {
+                        sendNumeric(c, "461", "MODE :Not enough parameters");
+                        return false;
+                    }
+                    channel->setKey(paramList[paramIndex++]);
+                    channel->setKeyProtected(true);
+                } else {
+                    channel->setKey("");
+                    channel->setKeyProtected(false);
+                }
+                break;
+                
+            case 'o': // operator
+                if (paramIndex >= paramList.size()) {
+                    sendNumeric(c, "461", "MODE :Not enough parameters");
+                    return false;
+                }
+                {
+                    std::string targetNick = paramList[paramIndex++];
+                    if (adding) {
+                        if (channel->hasUser(targetNick)) {
+                            channel->addOperator(targetNick);
+                        } else {
+                            sendNumeric(c, "441", targetNick + " " + channel->getName() + " :They aren't on that channel");
+                            return false;
+                        }
+                    } else {
+                        channel->removeOperator(targetNick);
+                    }
+                }
+                break;
+                
+            case 'l': // user limit
+                if (adding) {
+                    if (paramIndex >= paramList.size()) {
+                        sendNumeric(c, "461", "MODE :Not enough parameters");
+                        return false;
+                    }
+                    int limit = atoi(paramList[paramIndex++].c_str());
+                    if (limit <= 0) {
+                        sendNumeric(c, "461", "MODE :Invalid limit");
+                        return false;
+                    }
+                    channel->setUserLimit(limit);
+                    channel->setUserLimitSet(true);
+                } else {
+                    channel->setUserLimit(0);
+                    channel->setUserLimitSet(false);
+                }
+                break;
+                
+            default:
+                // Modo no soportado
+                sendNumeric(c, "472", std::string(1, mode) + " :is unknown mode char to me");
+                return false;
+        }
+    }
+    
+    return true;
 }

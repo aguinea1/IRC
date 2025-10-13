@@ -55,6 +55,7 @@ private:
     void removeClientFromAllChannels(Client* c);
     void broadcastToChannel(Channel* channel, const std::string& message, const std::string& excludeNick = "");
     bool isValidChannelName(const std::string& name) const;
+    bool processChannelModes(Channel* channel, Client* c, const std::string& modes, const std::string& params);
 
 public:
     Server(int port, const std::string& password);
