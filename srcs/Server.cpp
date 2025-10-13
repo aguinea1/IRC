@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <stdio.h>
+#include <sstream>
 //protocolo IRC:
 //Conexion TCP
 // cliente--servidor: el cliente tiene q abrir un socket, se conecta al servidor(puerto e IP), y el servidor lo guarda en lista de clientes(_clients)
@@ -27,6 +28,10 @@ Server::~Server() {
     for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it)
         delete it->second;
     _clients.clear();
+
+    for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it)
+        delete it->second;
+    _channels.clear();
 
     if (_listenFd >= 0) {
         ::close(_listenFd);
@@ -98,8 +103,10 @@ void Server::removeClient(int fd) {
     if (it == _clients.end()) return;
 
     Client* c = it->second;
-    if (!c->getNick().empty())
+    if (!c->getNick().empty()) {
         _nicks.erase(c->getNick());
+        removeClientFromAllChannels(c);
+    }
 
     std::cout << "[CLIENT] Disconnected fd: " << fd
               << " nick: " << (c->getNick().empty() ? "(none)" : c->getNick()) << std::endl;
@@ -225,6 +232,14 @@ void Server::processLine(Client* c, const std::string& line) {
     if (p.cmd == "USER") { cmdUSER(c, p.params); return; }
     if (p.cmd == "PRIVMSG") { cmdPRIVMSG(c, p.params); return; }
     if (p.cmd == "QUIT") { cmdQUIT(c, p.params); return; }
+    if (p.cmd == "JOIN") { cmdJOIN(c, p.params); return; }
+    if (p.cmd == "PART") { cmdPART(c, p.params); return; }
+    if (p.cmd == "TOPIC") { cmdTOPIC(c, p.params); return; }
+    if (p.cmd == "NAMES") { cmdNAMES(c, p.params); return; }
+    if (p.cmd == "LIST") { cmdLIST(c, p.params); return; }
+    if (p.cmd == "MODE") { cmdMODE(c, p.params); return; }
+    if (p.cmd == "KICK") { cmdKICK(c, p.params); return; }
+    if (p.cmd == "INVITE") { cmdINVITE(c, p.params); return; }
 
     sendNumeric(c, "421", p.cmd + " :Unknown command");
 }
@@ -300,19 +315,488 @@ void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params) {
     std::string target = params[0];
     std::string text   = params[1];
 
-    std::map<std::string, int>::iterator nt = _nicks.find(target);
-    if (nt == _nicks.end()) {
-        sendNumeric(c, "401", target + " :No such nick");
-        return;
-    }
-
-    std::map<int, Client*>::iterator dest = _clients.find(nt->second);
-    if (dest != _clients.end()) {
+    // Verificar si es un canal
+    if (target[0] == '#' || target[0] == '&') {
+        Channel* channel = getChannel(target);
+        if (!channel) {
+            sendNumeric(c, "401", target + " :No such nick/channel");
+            return;
+        }
+        if (!channel->hasUser(c->getNick())) {
+            sendNumeric(c, "404", target + " :Cannot send to channel");
+            return;
+        }
+        
         std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
-        dest->second->appendOutput(prefix + " PRIVMSG " + target + " :" + text);
+        std::string msg = prefix + " PRIVMSG " + target + " :" + text;
+        broadcastToChannel(channel, msg, c->getNick());
+    } else {
+        // Mensaje privado a usuario
+        std::map<std::string, int>::iterator nt = _nicks.find(target);
+        if (nt == _nicks.end()) {
+            sendNumeric(c, "401", target + " :No such nick/channel");
+            return;
+        }
+
+        std::map<int, Client*>::iterator dest = _clients.find(nt->second);
+        if (dest != _clients.end()) {
+            std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
+            dest->second->appendOutput(prefix + " PRIVMSG " + target + " :" + text);
+        }
     }
 }
 
 void Server::cmdQUIT(Client* c, const std::vector<std::string>&) {
     removeClient(c->getFd());//QUIT 
+}
+
+// -------------------- gestión de canales --------------------
+
+Channel* Server::getChannel(const std::string& name) {
+    std::map<std::string, Channel*>::iterator it = _channels.find(name);
+    return (it != _channels.end()) ? it->second : NULL;
+}
+
+Channel* Server::createChannel(const std::string& name) {
+    Channel* channel = new Channel(name);
+    _channels[name] = channel;
+    return channel;
+}
+
+void Server::removeChannel(const std::string& name) {
+    std::map<std::string, Channel*>::iterator it = _channels.find(name);
+    if (it != _channels.end()) {
+        delete it->second;
+        _channels.erase(it);
+    }
+}
+
+void Server::removeClientFromAllChannels(Client* c) {
+    std::string nickname = c->getNick();
+    if (nickname.empty()) return;
+
+    std::vector<std::string> channelsToRemove;
+    for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it) {
+        Channel* channel = it->second;
+        if (channel->hasUser(nickname)) {
+            channel->removeUser(nickname);
+            std::string prefix = ":" + nickname + "!" + c->getUsername() + "@" + c->getHost();
+            broadcastToChannel(channel, prefix + " QUIT :Client disconnected");
+            
+            if (channel->isEmpty()) {
+                channelsToRemove.push_back(it->first);
+            }
+        }
+    }
+    
+    for (size_t i = 0; i < channelsToRemove.size(); ++i) {
+        removeChannel(channelsToRemove[i]);
+    }
+}
+
+void Server::broadcastToChannel(Channel* channel, const std::string& message, const std::string& excludeNick) {
+    if (!channel) return;
+    
+    const std::set<std::string>& users = channel->getUsers();
+    for (std::set<std::string>::const_iterator it = users.begin(); it != users.end(); ++it) {
+        if (*it != excludeNick) {
+            std::map<std::string, int>::iterator nickIt = _nicks.find(*it);
+            if (nickIt != _nicks.end()) {
+                std::map<int, Client*>::iterator clientIt = _clients.find(nickIt->second);
+                if (clientIt != _clients.end()) {
+                    sendToClient(clientIt->second, message);
+                }
+            }
+        }
+    }
+}
+
+bool Server::isValidChannelName(const std::string& name) const {
+    if (name.empty() || name.length() > 50) return false;
+    if (name[0] != '#' && name[0] != '&') return false;
+    
+    for (size_t i = 1; i < name.length(); ++i) {
+        char c = name[i];
+        if (c == ' ' || c == '\a' || c == '\r' || c == '\n' || c == ',') {
+            return false;
+        }
+    }
+    return true;
+}
+
+// -------------------- comandos de canales --------------------
+
+void Server::cmdJOIN(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    if (params.empty()) {
+        sendNumeric(c, "461", "JOIN :Not enough parameters");
+        return;
+    }
+    
+    std::string channelName = params[0];
+    std::string key = (params.size() > 1) ? params[1] : "";
+    
+    if (!isValidChannelName(channelName)) {
+        sendNumeric(c, "403", channelName + " :No such channel");
+        return;
+    }
+    
+    Channel* channel = getChannel(channelName);
+    if (!channel) {
+        channel = createChannel(channelName);
+    }
+    
+    if (!channel->canJoin(c->getNick(), key)) {
+        if (channel->isInviteOnly() && !channel->isInvited(c->getNick())) {
+            sendNumeric(c, "473", channelName + " :Cannot join channel (+i)");
+        } else if (channel->isKeyProtected() && key != channel->getKey()) {
+            sendNumeric(c, "475", channelName + " :Cannot join channel (+k)");
+        } else if (channel->isUserLimitSet() && channel->getUserCount() >= static_cast<size_t>(channel->getUserLimit())) {
+            sendNumeric(c, "471", channelName + " :Cannot join channel (+l)");
+        } else {
+            sendNumeric(c, "403", channelName + " :No such channel");
+        }
+        return;
+    }
+    
+    channel->addUser(c->getNick());
+    if (channel->getUserCount() == 1) {
+        channel->addOperator(c->getNick());
+    }
+    
+    std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
+    std::string joinMsg = prefix + " JOIN :" + channelName;
+    
+    sendToClient(c, joinMsg);
+    broadcastToChannel(channel, joinMsg, c->getNick());
+    
+    if (!channel->getTopic().empty()) {
+        sendNumeric(c, "332", channelName + " :" + channel->getTopic());
+    }
+    
+    sendNumeric(c, "353", "= " + channelName + " :" + channel->getUserList());
+    sendNumeric(c, "366", channelName + " :End of /NAMES list");
+}
+
+void Server::cmdPART(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    if (params.empty()) {
+        sendNumeric(c, "461", "PART :Not enough parameters");
+        return;
+    }
+    
+    std::string channelName = params[0];
+    std::string reason = (params.size() > 1) ? params[1] : "Leaving";
+    
+    Channel* channel = getChannel(channelName);
+    if (!channel || !channel->hasUser(c->getNick())) {
+        sendNumeric(c, "442", channelName + " :You're not on that channel");
+        return;
+    }
+    
+    std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
+    std::string partMsg = prefix + " PART " + channelName + " :" + reason;
+    
+    sendToClient(c, partMsg);
+    broadcastToChannel(channel, partMsg, c->getNick());
+    
+    channel->removeUser(c->getNick());
+    if (channel->isEmpty()) {
+        removeChannel(channelName);
+    }
+}
+
+void Server::cmdTOPIC(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    if (params.empty()) {
+        sendNumeric(c, "461", "TOPIC :Not enough parameters");
+        return;
+    }
+    
+    std::string channelName = params[0];
+    Channel* channel = getChannel(channelName);
+    
+    if (!channel) {
+        sendNumeric(c, "403", channelName + " :No such channel");
+        return;
+    }
+    
+    if (!channel->hasUser(c->getNick())) {
+        sendNumeric(c, "442", channelName + " :You're not on that channel");
+        return;
+    }
+    
+    if (params.size() == 1) {
+        // Solicitar tópico
+        if (channel->getTopic().empty()) {
+            sendNumeric(c, "331", channelName + " :No topic is set");
+        } else {
+            sendNumeric(c, "332", channelName + " :" + channel->getTopic());
+        }
+    } else {
+        // Establecer tópico
+        if (channel->isTopicProtected() && !channel->isOperator(c->getNick())) {
+            sendNumeric(c, "482", channelName + " :You're not channel operator");
+            return;
+        }
+        
+        std::string newTopic = params[1];
+        channel->setTopic(newTopic);
+        
+        std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
+        std::string topicMsg = prefix + " TOPIC " + channelName + " :" + newTopic;
+        broadcastToChannel(channel, topicMsg);
+    }
+}
+
+void Server::cmdNAMES(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    
+    if (params.empty()) {
+        // Mostrar usuarios de todos los canales visibles
+        for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it) {
+            Channel* channel = it->second;
+            if (!channel->isSecret() || channel->hasUser(c->getNick())) {
+                sendNumeric(c, "353", "= " + channel->getName() + " :" + channel->getUserList());
+            }
+        }
+        sendNumeric(c, "366", "* :End of /NAMES list");
+    } else {
+        std::string channelName = params[0];
+        Channel* channel = getChannel(channelName);
+        
+        if (!channel) {
+            sendNumeric(c, "366", channelName + " :End of /NAMES list");
+            return;
+        }
+        
+        if (channel->isSecret() && !channel->hasUser(c->getNick())) {
+            sendNumeric(c, "366", channelName + " :End of /NAMES list");
+            return;
+        }
+        
+        sendNumeric(c, "353", "= " + channelName + " :" + channel->getUserList());
+        sendNumeric(c, "366", channelName + " :End of /NAMES list");
+    }
+}
+
+void Server::cmdLIST(Client* c, const std::vector<std::string>&) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    
+    sendNumeric(c, "321", "Channel :Users  Name");
+    
+    for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it) {
+        Channel* channel = it->second;
+        if (!channel->isSecret() || channel->hasUser(c->getNick())) {
+            std::ostringstream oss;
+            oss << channel->getUserCount();
+            std::string topic = channel->getTopic();
+            if (topic.empty()) topic = "No topic set";
+            sendNumeric(c, "322", channel->getName() + " " + oss.str() + " :" + topic);
+        }
+    }
+    
+    sendNumeric(c, "323", ":End of /LIST");
+}
+
+void Server::cmdMODE(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    if (params.empty()) {
+        sendNumeric(c, "461", "MODE :Not enough parameters");
+        return;
+    }
+    
+    std::string target = params[0];
+    
+    // Modos de canal
+    if (target[0] == '#' || target[0] == '&') {
+        Channel* channel = getChannel(target);
+        if (!channel) {
+            sendNumeric(c, "403", target + " :No such channel");
+            return;
+        }
+        
+        if (params.size() == 1) {
+            // Mostrar modos del canal
+            sendNumeric(c, "324", target + " " + channel->getModeString());
+        } else {
+            // Cambiar modos del canal
+            if (!channel->isOperator(c->getNick())) {
+                sendNumeric(c, "482", target + " :You're not channel operator");
+                return;
+            }
+            
+            std::string modes = params[1];
+            // Implementación básica de modos (se puede expandir)
+            sendNumeric(c, "324", target + " " + channel->getModeString());
+        }
+    } else {
+        // Modos de usuario (no implementado)
+        sendNumeric(c, "502", ":Cannot change mode for other users");
+    }
+}
+
+// -------------------- comandos de operadores --------------------
+
+void Server::cmdKICK(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    if (params.size() < 2) {
+        sendNumeric(c, "461", "KICK :Not enough parameters");
+        return;
+    }
+    
+    std::string channelName = params[0];
+    std::string targetNick = params[1];
+    std::string reason = (params.size() > 2) ? params[2] : c->getNick();
+    
+    // Verificar que el canal existe
+    Channel* channel = getChannel(channelName);
+    if (!channel) {
+        sendNumeric(c, "403", channelName + " :No such channel");
+        return;
+    }
+    
+    // Verificar que el cliente está en el canal
+    if (!channel->hasUser(c->getNick())) {
+        sendNumeric(c, "442", channelName + " :You're not on that channel");
+        return;
+    }
+    
+    // Verificar que el cliente es operador del canal
+    if (!channel->isOperator(c->getNick())) {
+        sendNumeric(c, "482", channelName + " :You're not channel operator");
+        return;
+    }
+    
+    // Verificar que el usuario objetivo está en el canal
+    if (!channel->hasUser(targetNick)) {
+        sendNumeric(c, "441", targetNick + " " + channelName + " :They aren't on that channel");
+        return;
+    }
+    
+    // No permitir que un operador se expulse a sí mismo
+    if (c->getNick() == targetNick) {
+        sendNumeric(c, "482", channelName + " :You cannot kick yourself");
+        return;
+    }
+    
+    // Encontrar el cliente objetivo
+    std::map<std::string, int>::iterator nickIt = _nicks.find(targetNick);
+    if (nickIt == _nicks.end()) {
+        sendNumeric(c, "401", targetNick + " :No such nick");
+        return;
+    }
+    
+    std::map<int, Client*>::iterator targetClientIt = _clients.find(nickIt->second);
+    if (targetClientIt == _clients.end()) {
+        sendNumeric(c, "401", targetNick + " :No such nick");
+        return;
+    }
+    
+    // Crear mensaje de KICK
+    std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
+    std::string kickMsg = prefix + " KICK " + channelName + " " + targetNick + " :" + reason;
+    
+    // Enviar mensaje de KICK a todos los usuarios del canal
+    broadcastToChannel(channel, kickMsg);
+    
+    // Remover al usuario del canal
+    channel->removeUser(targetNick);
+    
+    // Si el canal queda vacío, eliminarlo
+    if (channel->isEmpty()) {
+        removeChannel(channelName);
+    }
+    
+    std::cout << "[KICK] " << c->getNick() << " kicked " << targetNick 
+              << " from " << channelName << " (reason: " << reason << ")" << std::endl;
+}
+
+void Server::cmdINVITE(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    if (params.size() < 2) {
+        sendNumeric(c, "461", "INVITE :Not enough parameters");
+        return;
+    }
+    
+    std::string targetNick = params[0];
+    std::string channelName = params[1];
+    
+    // Verificar que el canal existe
+    Channel* channel = getChannel(channelName);
+    if (!channel) {
+        sendNumeric(c, "403", channelName + " :No such channel");
+        return;
+    }
+    
+    // Verificar que el cliente está en el canal
+    if (!channel->hasUser(c->getNick())) {
+        sendNumeric(c, "442", channelName + " :You're not on that channel");
+        return;
+    }
+    
+    // Verificar que el cliente es operador del canal
+    if (!channel->isOperator(c->getNick())) {
+        sendNumeric(c, "482", channelName + " :You're not channel operator");
+        return;
+    }
+    
+    // Verificar que el usuario objetivo existe
+    std::map<std::string, int>::iterator nickIt = _nicks.find(targetNick);
+    if (nickIt == _nicks.end()) {
+        sendNumeric(c, "401", targetNick + " :No such nick");
+        return;
+    }
+    
+    std::map<int, Client*>::iterator targetClientIt = _clients.find(nickIt->second);
+    if (targetClientIt == _clients.end()) {
+        sendNumeric(c, "401", targetNick + " :No such nick");
+        return;
+    }
+    
+    Client* targetClient = targetClientIt->second;
+    
+    // Verificar que el usuario objetivo no está ya en el canal
+    if (channel->hasUser(targetNick)) {
+        sendNumeric(c, "443", targetNick + " " + channelName + " :is already on channel");
+        return;
+    }
+    
+    // Agregar invitación
+    channel->addInvited(targetNick);
+    
+    // Enviar mensaje de invitación al usuario objetivo
+    std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
+    std::string inviteMsg = prefix + " INVITE " + targetNick + " :" + channelName;
+    sendToClient(targetClient, inviteMsg);
+    
+    // Enviar confirmación al operador
+    sendNumeric(c, "341", targetNick + " " + channelName);
+    
+    std::cout << "[INVITE] " << c->getNick() << " invited " << targetNick 
+              << " to " << channelName << std::endl;
 }

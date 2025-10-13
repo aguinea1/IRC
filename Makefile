@@ -17,10 +17,12 @@ DEPDIR			= deps
 
 SRCS =	$(SRCDIR)/main.cpp		\
 		$(SRCDIR)/Server.cpp	\
-		$(SRCDIR)/Client.cpp
+		$(SRCDIR)/Client.cpp	\
+		$(SRCDIR)/Channel.cpp
 
 HEADERS =	$(SRCDIR)/Server.hpp		\
-			$(SRCDIR)/Client.hpp		
+			$(SRCDIR)/Client.hpp		\
+			$(SRCDIR)/Channel.hpp		
 
 
 ################################################################################
