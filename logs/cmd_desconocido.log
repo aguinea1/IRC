@@ -1,0 +1,2 @@
+:irc.local 001 carla :Welcome to the IRC server carla
+:irc.local 421 carla FOOBAR :Unknown command

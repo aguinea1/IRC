@@ -8,12 +8,7 @@
 #include <cerrno>
 #include <stdio.h>
 #include <sstream>
-//protocolo IRC:
-//Conexion TCP
-// cliente--servidor: el cliente tiene q abrir un socket, se conecta al servidor(puerto e IP), y el servidor lo guarda en lista de clientes(_clients)
-// a partir de ahi el cliente ya puede usar comandos del protocolo IRC(JOIN, PART etc...)
-// cada cliente cuenta con su socket y dos buffers(datos, del cliente, datos q el server le quiere enviar)
-//formato irc:[:prefix] COMMAND [param1] [param2] ... [:último parámetro con espacios], (:juan!j@localhost PRIVMSG #chat :Hola a todos)
+#include <cstdlib>
 
 
 // -------------------- constructor / destructor --------------------
@@ -25,11 +20,11 @@ Server::Server(int port, const std::string& password)
 }
 
 Server::~Server() {
-    for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it)
+    for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it)//eliminar clientes
         delete it->second;
     _clients.clear();
 
-    for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it)
+    for (std::map<std::string, Channel*>::iterator it = _channels.begin(); it != _channels.end(); ++it)//eliminar canales
         delete it->second;
     _channels.clear();
 
@@ -44,31 +39,32 @@ Server::~Server() {
 
 //Non-blcking = para que no se quede esperando el socket del primer cliente y atienda a los de despues(sino se queda bloqueando esperando al primero)
 void Server::setNonBlocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags < 0) flags = 0;
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int flags = fcntl(fd, F_GETFL, 0);//obtener flags(getfl) del fd(en este caso si ya es non-blocking)
+    if (flags < 0) 
+    flags = 0;
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);//(setfl) setear flags de nonblock al fd manteniendo los flags antiguos
 }
 
-void Server::setupListen() {//creacion de socket
-    _listenFd = ::socket(AF_INET, SOCK_STREAM, 0);
+void Server::setupListen() {/
+    _listenFd = ::socket(AF_INET, SOCK_STREAM, 0);//creamos socket del server(con canal de comunicacion(fd)), AF_INET(direcciones ipv4), conexiones TCP(SOCK_STREAM)
     if (_listenFd < 0)
         throw std::runtime_error("socket() failed");
 
     int opt = 1;
     setsockopt(_listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr;//de esta struct sacamos la direccion ip
+    //configurar socket(en _listeFd)
+    sockaddr_in addr;//en esta struct guardamos la direccion ip, puerto, socket
     std::memset(&addr, 0, sizeof(addr));//limpiar
     addr.sin_family = AF_INET;//para usar (IPv4, puede ser Ipv6 etc..)
     addr.sin_addr.s_addr = htonl(INADDR_ANY);//INADDR_ANY(para q puda ser localhost, LAN etc..)
     //htnol para ordenar numero de 32 bit al estandar(el orden inicial depende de la CPU)
     addr.sin_port = htons(static_cast<uint16_t>(_port));//define num de puerto
 
-    if (::bind(_listenFd, (sockaddr*)&addr, sizeof(addr)) < 0) {//abrir puerto
+    if (::bind(_listenFd, (sockaddr*)&addr, sizeof(addr)) < 0) {//abrir puerto(bind asocia un socket auna ip y puerto)
         ::close(_listenFd);
         throw std::runtime_error("bind() failed");
     }
-    if (::listen(_listenFd, 128) < 0) {//se pone en escucha al kernel
+    if (::listen(_listenFd, 128) < 0) {//se pone en escucha al kernel(para que acepte conexiones), se pueden poner 128 maximo a la cola, sino las rechaza
         ::close(_listenFd);
         throw std::runtime_error("listen() failed");
     }
@@ -79,10 +75,11 @@ void Server::setupListen() {//creacion de socket
 
 // -------------------- clientes --------------------
 
-void Server::acceptNewClient() {
-    sockaddr_in cliaddr;
+void Server::acceptNewClient() {   
+    sockaddr_in cliaddr;//creamos un socket por cliente(cada uno con su fd)
     socklen_t len = sizeof(cliaddr);
-    int cfd = ::accept(_listenFd, (sockaddr*)&cliaddr, &len);
+    int cfd = ::accept(_listenFd, (sockaddr*)&cliaddr, &len);//espera conexion ya q es non-blocking
+    //devuelve el fd del cliente
     if (cfd < 0) return;
 
     setNonBlocking(cfd);
@@ -91,7 +88,7 @@ void Server::acceptNewClient() {
     const char* ip = inet_ntop(AF_INET, &cliaddr.sin_addr, buf, sizeof(buf) - 1);
     std::string host = ip ? std::string(ip) : "unknown";
 
-    Client* c = new Client(cfd, host);
+    Client* c = new Client(cfd, host);//fd de client + ip legible
     _clients[cfd] = c;
 
     std::cout << "[CLIENT] Connected from " << host << " (fd " << cfd << ")" << std::endl;
@@ -166,7 +163,7 @@ Server::Parsed Server::parseLine(const std::string& lineIn) {
 void Server::run(bool &running) {
     while (running) {
         fd_set readfds, writefds;//fd_set: estructuras que guarda varios fds(como un puntero a fds)
-        FD_ZERO(&readfds);//inicializar/limpiar fds
+        FD_ZERO(&readfds);
         FD_ZERO(&writefds);
         int maxfd = _listenFd;
         FD_SET(_listenFd, &readfds);//_listenFd a readfds(fds q select mira si se han modificado)
@@ -268,7 +265,7 @@ void Server::cmdNICK(Client* c, const std::vector<std::string>& params) {
         return;
     }
     std::string newnick = params[0];
-    if (_nicks.count(newnick) && _nicks[newnick] != c->getFd()) {
+    if (_nicks.count(newnick) && _nicks[newnick] != c->getFd()) {//buscar en map si exisxte y mirar si nexiste que no sea de el mismo
         sendNumeric(c, "433", newnick + " :Nickname is already in use");
         return;
     }
@@ -902,7 +899,7 @@ bool Server::processChannelModes(Channel* channel, Client* c, const std::string&
                     if (limit <= 0) {
                         sendNumeric(c, "461", "MODE :Invalid limit");
                         return false;
-                    }
+                        }
                     channel->setUserLimit(limit);
                     channel->setUserLimitSet(true);
                 } else {

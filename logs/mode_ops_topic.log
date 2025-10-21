@@ -1,0 +1,6 @@
+:irc.local 001 chanop :Welcome to the IRC server chanop
+:chanop!c@127.0.0.1 JOIN :#tema
+:irc.local 353 chanop = #tema :@chanop
+:irc.local 366 chanop #tema :End of /NAMES list
+:chanop!c@127.0.0.1 MODE #tema +t
+:chanop!c@127.0.0.1 TOPIC #tema :solo op puede cambiar esto

@@ -3,7 +3,7 @@
 ################################################################################
 
 NAME			= ircserv
-CC			= c++
+CC				= c++
 CFLAGS 			= -Wall -Wextra -Werror -Wno-shadow -std=c++98 -MMD -fsanitize=address
 DEPFLAGS		= -MMD -MF $(DEPDIR)/$*.d
 

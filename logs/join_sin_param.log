@@ -1,0 +1,2 @@
+:irc.local 001 noparams :Welcome to the IRC server noparams
+:irc.local 461 noparams JOIN :Not enough parameters
