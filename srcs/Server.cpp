@@ -314,6 +314,8 @@ void Server::cmdNICK(Client* c, const std::vector<std::string>& params) {
         c->markRegistered();
         // Antes enviabas solo 001; ahora Welcome completo para irssi
         sendWelcome(*c);
+        // Bot saluda al nuevo usuario
+        botWelcomeUser(c);
     }
 }
 
@@ -339,6 +341,8 @@ void Server::cmdUSER(Client* c, const std::vector<std::string>& params) {
     if (c->passOk() && c->hasNick() && c->hasUser() && !c->isRegistered()) {
         c->markRegistered();
         sendWelcome(*c);
+        // Bot saluda al nuevo usuario
+        botWelcomeUser(c);
     }
 }
 
@@ -431,6 +435,18 @@ void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params, const
         std::string msg = prefix + " PRIVMSG " + target + " :" + text;
         broadcastToChannel(channel, msg, c->getNick());
     } else {
+        // Verificar si el mensaje es para el bot
+        if (target == "ServerBot") {
+            // PROTECCIÓN QUIT: Verificar que el cliente aún existe
+            if (_clients.find(c->getFd()) == _clients.end()) {
+                return;
+            }
+            
+            // Procesar comando del bot
+            botProcessCommand(c, text, "");
+            return;
+        }
+        
         std::map<std::string, int>::iterator nt = _nicks.find(target);
         if (nt == _nicks.end()) {
             sendNumeric(c, "401", target + " :No such nick/channel");
@@ -959,4 +975,70 @@ bool Server::processChannelModes(Channel* channel, Client* c, const std::string&
     }
     
     return true;
+}
+
+// -------------------- funciones del bot --------------------
+
+void Server::botSendMessage(Client* target, const std::string& message) {
+    if (!target) return;
+    
+    std::string botPrefix = ":ServerBot!bot@" + serverPrefix().substr(1);
+    std::string botMsg = botPrefix + " PRIVMSG " + target->getNick() + " :" + message;
+    
+    target->appendOutput(ensureCRLF(botMsg));
+}
+
+void Server::botWelcomeUser(Client* newUser) {
+    if (!newUser || !newUser->isRegistered()) return;
+    
+    // Mensaje de bienvenida del bot
+    botSendMessage(newUser, "¡Hola " + newUser->getNick() + "! 👋 Bienvenido al servidor IRC.");
+    botSendMessage(newUser, "Soy ServerBot, tu asistente virtual. Escribe 'PRIVMSG ServerBot :help' para ver los comandos disponibles.");
+    botSendMessage(newUser, "¡Que disfrutes tu estancia en el servidor! 🚀");
+}
+
+void Server::botProcessCommand(Client* sender, const std::string& command, const std::string& args) {
+    if (!sender) return;
+    
+    (void)args; // Evitar warning de parámetro no usado
+    
+    std::string cmd = command;
+    // Convertir a minúsculas para comparación
+    for (size_t i = 0; i < cmd.size(); ++i) {
+        cmd[i] = static_cast<char>(std::tolower(cmd[i]));
+    }
+    
+    if (cmd == "help" || cmd == "ayuda") {
+        botSendMessage(sender, " Comandos disponibles del ServerBot:");
+        botSendMessage(sender, "• help/ayuda - Muestra esta ayuda");
+        botSendMessage(sender, "• info - Información del servidor");
+        botSendMessage(sender, "• time/hora - Hora actual del servidor");
+        botSendMessage(sender, "• users/usuarios - Número de usuarios conectados");
+        botSendMessage(sender, "• channels/canales - Número de canales activos");
+    }
+    else if (cmd == "info") {
+        botSendMessage(sender, "  Información del servidor:");
+        botSendMessage(sender, "• Nombre: " + serverPrefix().substr(1));
+        botSendMessage(sender, "• Versión: IRC Server 1.0");
+        botSendMessage(sender, "• Funciones: Canales, modos, mensajes privados");
+    }
+    else if (cmd == "time" || cmd == "hora") {
+        time_t now = time(NULL);
+        std::string timeStr = ctime(&now) ? ctime(&now) : "Hora no disponible";
+        if (!timeStr.empty() && timeStr[timeStr.size()-1] == '\n') timeStr.erase(timeStr.size()-1);
+        botSendMessage(sender, " Hora del servidor: " + timeStr);
+    }
+    else if (cmd == "users" || cmd == "usuarios") {
+        std::ostringstream oss;
+        oss << _clients.size();
+        botSendMessage(sender, " Usuarios conectados: " + oss.str());
+    }
+    else if (cmd == "channels" || cmd == "canales") {
+        std::ostringstream oss;
+        oss << _channels.size();
+        botSendMessage(sender, " Canales activos: " + oss.str());
+    }
+    else {
+        botSendMessage(sender, " Comando no reconocido. Escribe 'help' para ver los comandos disponibles.");
+    }
 }
