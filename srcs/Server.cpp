@@ -45,7 +45,7 @@ void Server::setNonBlocking(int fd) {
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);//(setfl) setear flags de nonblock al fd manteniendo los flags antiguos
 }
 
-void Server::setupListen() {/
+void Server::setupListen() {
     _listenFd = ::socket(AF_INET, SOCK_STREAM, 0);//creamos socket del server(con canal de comunicacion(fd)), AF_INET(direcciones ipv4), conexiones TCP(SOCK_STREAM)
     if (_listenFd < 0)
         throw std::runtime_error("socket() failed");
@@ -309,6 +309,10 @@ void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params) {
         sendNumeric(c, "411", ":No recipient given (PRIVMSG)");
         return;
     }
+    if (params.size() > 2) {
+        sendNumeric(c, "461", "PRIVMSG :Invalid format. Use: PRIVMSG <target> :<message>");
+        return;
+    }
     std::string target = params[0];
     std::string text   = params[1];
 
@@ -343,8 +347,14 @@ void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params) {
     }
 }
 
-void Server::cmdQUIT(Client* c, const std::vector<std::string>&) {
-    removeClient(c->getFd());//QUIT 
+void Server::cmdQUIT(Client* c, const std::vector<std::string>& params) {
+    std::string reason = "Client disconnected";
+    if (!params.empty()) {
+        reason = params[0];
+    }
+    
+    std::cout << "[QUIT] " << c->getNick() << " disconnecting: " << reason << std::endl;
+    removeClient(c->getFd());
 }
 
 // -------------------- gestión de canales --------------------
