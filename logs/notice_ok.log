@@ -1,0 +1,5 @@
+:irc.local 001 informador :Welcome to the IRC server informador
+:informador!i@127.0.0.1 JOIN :#avisos
+:irc.local 353 informador = #avisos :@informador
+:irc.local 366 informador #avisos :End of /NAMES list
+:irc.local 421 informador NOTICE :Unknown command

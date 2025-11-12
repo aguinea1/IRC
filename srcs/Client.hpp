@@ -1,29 +1,56 @@
-// Client.hpp
 #ifndef CLIENT_HPP
 #define CLIENT_HPP
 
 #include <string>
-#include <ctime>
-#include "Server.hpp"
+#include <vector>
+#include <iostream>
+#include <unistd.h>
 
 class Client {
-public:
-    int fd;
-    std::string nick;
-    std::string username;
-    std::string realname;
-    std::string buffer_in;
-    std::string buffer_out;
-    bool registered;
-    std::string modes;
-    time_t last_activity;
+private:
+    int _fd;
+    std::string _host;
+    std::string _nick;
+    std::string _username;
+    std::string _realname;
+    std::string _bufferIn;
+    std::string _bufferOut;
+    bool _passOk;
+    bool _hasNick;
+    bool _hasUser;
+    bool _registered;
 
-    Client(int socket);
+public:
+    Client(int fd, const std::string& host);
     ~Client();
 
-    void resetBuffers();
-    //Client(const Client&) = delete;
-    //Client& operator=(const Client&) = delete;
+    int getFd() const;
+    const std::string& getNick() const;
+    const std::string& getUsername() const;
+    const std::string& getHost() const;
+    bool isRegistered() const;
+
+    void setNick(const std::string& n);
+    void setUsername(const std::string& u);
+    void setRealname(const std::string& r);
+    void markPassOk();
+    void markRegistered();
+
+    bool readFromSocket();
+    bool writeToSocket();
+
+    bool hasCompleteLine() const;
+    std::string extractLine();
+
+    void appendOutput(const std::string& msg);
+    void clearBuffers();
+
+    // Estado de registro
+    bool passOk() const { return _passOk; }
+    bool hasNick() const { return _hasNick; }
+    bool hasUser() const { return _hasUser; }
+    void setHasNick(bool v) { _hasNick = v; }
+    void setHasUser(bool v) { _hasUser = v; }
 };
 
 #endif

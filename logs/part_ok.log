@@ -1,0 +1,4 @@
+:irc.local 001 partman :Welcome to the IRC server partman
+:partman!p@127.0.0.1 JOIN :#salida
+:irc.local 353 partman = #salida :@partman
+:irc.local 366 partman #salida :End of /NAMES list

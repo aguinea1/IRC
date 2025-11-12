@@ -1,61 +1,45 @@
-#include <iostream>
-#include <string>
-#include <cstdlib>
-#include <cctype>
 #include "Server.hpp"
-#include "Client.hpp"
-//Probando si password esta vacio
-static bool parse_pass(const std::string &pass) {
-    if (!pass.empty())
-        return true;
-    std::cout << "Error:\nWrong password\n";
-    return false;
-}
-//probando si port son 4 numeros y si se encuentra entre 1 y 65535(protocolo TCP)el mayor valor que cabe en 16 bits)
-static bool parse_port(const std::string &port) {
-    for (size_t i = 0; i < port.size(); i++) {
-        if (!std::isdigit(port[i])) {
-            std::cout << "Error:\nWrong port" << std::endl;
-            return false;
-        }
-    }
-    long p = std::strtol(port.c_str(), NULL, 10);//el numero en base 10
-    if (p < 1 || p > 65535) {
-        std::cout << "Error:\nWrong port" << std::endl;
-        return false;
-    }
-    return true;
+#include <iostream>
+#include <csignal>
+#include <cstdlib>
+
+static bool running = true;
+
+static bool validPort(long p) { return p > 0 && p <= 65535; }
+
+static void handleSigint(int) {//Ctrl + c
+    std::cout << "\n[SERVER] SIGINT received, shutting down..." << std::endl;
+    running = false;          
 }
 
-static bool parse(char **av) {
-    std::string port = av[1];
-    std::string pass = av[2];
-    return parse_port(port) && parse_pass(pass);
-}
-
-static void message(const std::string &port, const std::string &password) {
-    std::cout << "Listening on port " << port
-              << " With password: " << password << std::endl;
-}
-
-int main(int ac, char **av) {
-    if (ac != 3) {
-        std::cout << "Error:\nInvalid number of Arguments.\n"
-                  << "Usage: ./ircserv <port> <password>" << std::endl;
+int main(int argc, char** argv) {
+    if (argc != 3) {
+        std::cerr << "Usage: ./ircserv <port> <password>\n";
         return 1;
-    } 
-
-    if (parse(av)) {
-        message(av[1], av[2]);
-		int port = std::atoi(av[1]);
-		std::string pass = av[2];
-		Server server(port, pass);
-		server.init();
-		server.run();
-
     }
+
+    char* end = 0;
+    long p = std::strtol(argv[1], &end, 10);
+    if (!end || *end || !validPort(p)) {
+        std::cerr << "Invalid port\n";
+        return 1;
+    }
+
+    std::string pass = argv[2];
+    if (pass.empty()) {
+        std::cerr << "Password must not be empty\n";
+        return 1;
+    }
+
+    std::signal(SIGINT, handleSigint);
+
+    try {
+        Server s(static_cast<int>(p), pass);//constructor del serve(puerto, password)
+        s.run(running);
+    } catch (const std::exception& e) {
+        std::cerr << "Fatal: " << e.what() << "\n";
+        return 1;
+    }
+
     return 0;
 }
-
-
-
