@@ -32,7 +32,7 @@ private:
     void cmdPASS(Client* c, const std::vector<std::string>& params);
     void cmdNICK(Client* c, const std::vector<std::string>& params);
     void cmdUSER(Client* c, const std::vector<std::string>& params);
-    void cmdPRIVMSG(Client* c, const std::vector<std::string>& params);
+    void cmdPRIVMSG(Client* c, const std::vector<std::string>& params, const std::string& originalLine);
     void cmdQUIT(Client* c, const std::vector<std::string>& params);
     void cmdJOIN(Client* c, const std::vector<std::string>& params);
     void cmdPART(Client* c, const std::vector<std::string>& params);

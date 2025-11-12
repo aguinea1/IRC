@@ -262,7 +262,7 @@ void Server::processLine(Client* c, const std::string& line) {
     if (p.cmd == "PASS") { cmdPASS(c, p.params); return; }
     if (p.cmd == "NICK") { cmdNICK(c, p.params); return; }
     if (p.cmd == "USER") { cmdUSER(c, p.params); return; }
-    if (p.cmd == "PRIVMSG") { cmdPRIVMSG(c, p.params); return; }
+    if (p.cmd == "PRIVMSG") { cmdPRIVMSG(c, p.params, line); return; }
     if (p.cmd == "QUIT") { cmdQUIT(c, p.params); return; }
     if (p.cmd == "JOIN") { cmdJOIN(c, p.params); return; }
     if (p.cmd == "PART") { cmdPART(c, p.params); return; }
@@ -342,17 +342,73 @@ void Server::cmdUSER(Client* c, const std::vector<std::string>& params) {
     }
 }
 
-void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params) {
+void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params, const std::string& originalLine) {
     if (!c->isRegistered()) {
         sendNumeric(c, "451", ":You have not registered");
         return;
     }
-    if (params.size() < 2) {
+    if (params.empty()) {
         sendNumeric(c, "411", ":No recipient given (PRIVMSG)");
         return;
     }
+    if (params.size() < 2) {
+        sendNumeric(c, "412", ":No text to send");
+        return;
+    }
+    
     std::string target = params[0];
-    std::string text   = params[1];
+    
+    // VALIDACIÓN ULTRA ESTRICTA: Analizar la línea original para canales
+    if (target[0] == '#' || target[0] == '&') {
+        // Buscar el patrón: PRIVMSG #canal :mensaje
+        // Debe haber EXACTAMENTE un espacio entre el canal y los ":"
+        std::string cleanLine = originalLine;
+        // Limpiar \r\n
+        if (!cleanLine.empty() && cleanLine[cleanLine.size()-1] == '\n') cleanLine.erase(cleanLine.size() - 1);
+        if (!cleanLine.empty() && cleanLine[cleanLine.size()-1] == '\r') cleanLine.erase(cleanLine.size() - 1);
+        
+        // Buscar "PRIVMSG" (insensible a mayúsculas)
+        std::string upperLine = cleanLine;
+        for (size_t i = 0; i < upperLine.size(); ++i) {
+            upperLine[i] = static_cast<char>(std::toupper(upperLine[i]));
+        }
+        
+        size_t privmsgPos = upperLine.find("PRIVMSG");
+        if (privmsgPos == std::string::npos) {
+            sendNumeric(c, "412", ":No text to send");
+            return;
+        }
+        
+        // Buscar el inicio del canal después de PRIVMSG
+        size_t pos = privmsgPos + 7; // "PRIVMSG" = 7 caracteres
+        while (pos < cleanLine.size() && cleanLine[pos] == ' ') ++pos;
+        
+        // Ahora pos debe apuntar al inicio del canal
+        if (pos >= cleanLine.size() || (cleanLine[pos] != '#' && cleanLine[pos] != '&')) {
+            sendNumeric(c, "412", ":No text to send");
+            return;
+        }
+        
+        // Buscar el final del canal (primer espacio después del canal)
+        while (pos < cleanLine.size() && cleanLine[pos] != ' ') ++pos;
+        
+        // Saltar espacios después del canal
+        while (pos < cleanLine.size() && cleanLine[pos] == ' ') ++pos;
+        
+        // El siguiente carácter DEBE ser ':'
+        if (pos >= cleanLine.size() || cleanLine[pos] != ':') {
+            sendNumeric(c, "412", ":No text to send");
+            return;
+        }
+    }
+    
+    // VALIDACIÓN ADICIONAL: Si hay más de 2 parámetros, formato incorrecto
+    if (params.size() > 2) {
+        sendNumeric(c, "412", ":No text to send");
+        return;
+    }
+    
+    std::string text = params[1];
 
     if (target[0] == '#' || target[0] == '&') {
         Channel* channel = getChannel(target);
@@ -365,6 +421,12 @@ void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params) {
             return;
         }
         
+        // PROTECCIÓN QUIT: Verificar que el cliente aún existe antes de enviar el mensaje
+        if (_clients.find(c->getFd()) == _clients.end()) {
+            // El cliente ha hecho QUIT, no enviar el mensaje
+            return;
+        }
+        
         std::string prefix = ":" + c->getNick() + "!" + c->getUsername() + "@" + c->getHost();
         std::string msg = prefix + " PRIVMSG " + target + " :" + text;
         broadcastToChannel(channel, msg, c->getNick());
@@ -372,6 +434,12 @@ void Server::cmdPRIVMSG(Client* c, const std::vector<std::string>& params) {
         std::map<std::string, int>::iterator nt = _nicks.find(target);
         if (nt == _nicks.end()) {
             sendNumeric(c, "401", target + " :No such nick/channel");
+            return;
+        }
+
+        // PROTECCIÓN QUIT: Verificar que el cliente aún existe antes de enviar el mensaje
+        if (_clients.find(c->getFd()) == _clients.end()) {
+            // El cliente ha hecho QUIT, no enviar el mensaje
             return;
         }
 
