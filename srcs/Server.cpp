@@ -200,6 +200,8 @@ void Server::run(bool &running) {
         FD_ZERO(&writefds);
         int maxfd = _listenFd;
         FD_SET(_listenFd, &readfds);
+        FD_SET(0, &readfds); // stdin para Ctrl+D
+        if (0 > maxfd) maxfd = 0;
 
         for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
             int fd = it->first;
@@ -219,6 +221,17 @@ void Server::run(bool &running) {
 
         if (FD_ISSET(_listenFd, &readfds))
             acceptNewClient();
+
+        // Manejar Ctrl+D desde stdin
+        if (FD_ISSET(0, &readfds)) {
+            char c;
+            ssize_t n = ::read(0, &c, 1);
+            if (n == 0) { // EOF (Ctrl+D)
+                std::cout << "\n[SERVER] Ctrl+D detected, shutting down..." << std::endl;
+                running = false;
+                break;
+            }
+        }
 
         std::map<int, Client*>::iterator it = _clients.begin();
         while (it != _clients.end()) {
@@ -251,6 +264,35 @@ void Server::run(bool &running) {
         fds.push_back(it->first);
     for (size_t i = 0; i < fds.size(); ++i)
         removeClient(fds[i]);
+}
+
+// -------------------- validaciones --------------------
+
+bool Server::isValidNick(const std::string& nick) {
+    // Lista de comandos IRC que no pueden ser usados como nick
+    static const char* forbidden[] = {
+        "PASS", "NICK", "USER", "PRIVMSG", "QUIT", "JOIN", "PART", 
+        "TOPIC", "NAMES", "LIST", "MODE", "KICK", "INVITE", "WHO",
+        "WHOIS", "PING", "PONG", "NOTICE", "AWAY", "ISON", "VERSION",
+        "TIME", "ADMIN", "INFO", "MOTD", "LUSERS", "STATS", "LINKS",
+        "CONNECT", "TRACE", "WALLOPS", "USERHOST", "OPER", "KILL",
+        "REHASH", "RESTART", "SQUIT", "SERVER", NULL
+    };
+    
+    // Convertir nick a mayúsculas para comparación
+    std::string upperNick = nick;
+    for (size_t i = 0; i < upperNick.size(); ++i) {
+        upperNick[i] = static_cast<char>(std::toupper(upperNick[i]));
+    }
+    
+    // Verificar contra comandos prohibidos
+    for (int i = 0; forbidden[i] != NULL; ++i) {
+        if (upperNick == forbidden[i]) {
+            return false;
+        }
+    }
+    
+    return true;
 }
 
 // -------------------- comandos --------------------
@@ -300,6 +342,13 @@ void Server::cmdNICK(Client* c, const std::vector<std::string>& params) {
         return;
     }
     std::string newnick = params[0];
+    
+    // Validar que el nick no sea un comando IRC
+    if (!isValidNick(newnick)) {
+        sendNumeric(c, "432", newnick + " :Erroneous nickname (cannot use IRC commands as nicknames)");
+        return;
+    }
+    
     if (_nicks.count(newnick) && _nicks[newnick] != c->getFd()) {
         sendNumeric(c, "433", newnick + " :Nickname is already in use");
         return;

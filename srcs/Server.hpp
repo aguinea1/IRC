@@ -43,6 +43,9 @@ private:
     void cmdKICK(Client* c, const std::vector<std::string>& params);
     void cmdINVITE(Client* c, const std::vector<std::string>& params);
 
+    // validaciones
+    bool isValidNick(const std::string& nick);
+
     // helpers
     void sendToClient(Client* c, const std::string& msg);
     void sendNumeric(Client* c, const std::string& code, const std::string& args);
