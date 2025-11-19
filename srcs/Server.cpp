@@ -314,6 +314,7 @@ void Server::processLine(Client* c, const std::string& line) {
     if (p.cmd == "MODE") { cmdMODE(c, p.params); return; }
     if (p.cmd == "KICK") { cmdKICK(c, p.params); return; }
     if (p.cmd == "INVITE") { cmdINVITE(c, p.params); return; }
+    if (p.cmd == "DCC") { cmdDCC(c, p.params); return; }
 
     sendNumeric(c, "421", p.cmd + " :Unknown command");
 }
@@ -1026,6 +1027,109 @@ bool Server::processChannelModes(Channel* channel, Client* c, const std::string&
     return true;
 }
 
+// -------------------- transferencia de archivos DCC --------------------
+
+void Server::cmdDCC(Client* c, const std::vector<std::string>& params) {
+    if (!c->isRegistered()) {
+        sendNumeric(c, "451", ":You have not registered");
+        return;
+    }
+    
+    if (params.size() < 2) {
+        sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC Usage: DCC SEND <nick> <filename> | DCC ACCEPT <nick> <filename>");
+        return;
+    }
+    
+    std::string subcommand = params[0];
+    for (size_t i = 0; i < subcommand.size(); ++i) {
+        subcommand[i] = static_cast<char>(std::toupper(subcommand[i]));
+    }
+    
+    if (subcommand == "SEND") {
+        if (params.size() < 3) {
+            sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC SEND Usage: DCC SEND <nick> <filename>");
+            return;
+        }
+        
+        std::string targetNick = params[1];
+        std::string filename = params[2];
+        
+        // Buscar el cliente objetivo
+        Client* target = NULL;
+        for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+            if (it->second->getNick() == targetNick) {
+                target = it->second;
+                break;
+            }
+        }
+        
+        if (!target) {
+            sendNumeric(c, "401", targetNick + " :No such nick/channel");
+            return;
+        }
+        
+        // Simular oferta DCC (en un servidor real, aquí se abriría un puerto)
+        std::string dccOffer = ":";
+        dccOffer += c->getNick();
+        dccOffer += "!";
+        dccOffer += c->getUsername().empty() ? "user" : c->getUsername();
+        dccOffer += "@";
+        dccOffer += c->getHost();
+        dccOffer += " PRIVMSG ";
+        dccOffer += target->getNick();
+        dccOffer += " :\001DCC SEND ";
+        dccOffer += filename;
+        dccOffer += " 2130706433 0 ";  // IP simulada (127.0.0.1 en decimal)
+        
+        // Calcular tamaño del archivo (simulado)
+        dccOffer += "1024";  // Tamaño simulado
+        dccOffer += "\001";
+        
+        sendToClient(target, dccOffer);
+        sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC SEND offer sent to " + targetNick + " for file: " + filename);
+        
+    } else if (subcommand == "ACCEPT") {
+        if (params.size() < 3) {
+            sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC ACCEPT Usage: DCC ACCEPT <nick> <filename>");
+            return;
+        }
+        
+        std::string senderNick = params[1];
+        std::string filename = params[2];
+        
+        // Buscar el cliente que envió la oferta
+        Client* sender = NULL;
+        for (std::map<int, Client*>::iterator it = _clients.begin(); it != _clients.end(); ++it) {
+            if (it->second->getNick() == senderNick) {
+                sender = it->second;
+                break;
+            }
+        }
+        
+        if (!sender) {
+            sendNumeric(c, "401", senderNick + " :No such nick/channel");
+            return;
+        }
+        
+        // Simular aceptación de transferencia
+        sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC file transfer accepted from " + senderNick + ": " + filename);
+        sendToClient(sender, ":irc.local NOTICE " + sender->getNick() + " :" + c->getNick() + " accepted your DCC SEND for: " + filename);
+        
+        // Simular progreso de transferencia
+        sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC Transfer starting...");
+        sendToClient(sender, ":irc.local NOTICE " + sender->getNick() + " :DCC Transfer starting...");
+        
+        sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC Transfer: " + filename + " [50%]");
+        sendToClient(sender, ":irc.local NOTICE " + sender->getNick() + " :DCC Transfer: " + filename + " [50%]");
+        
+        sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :DCC Transfer completed: " + filename + " (1024 bytes)");
+        sendToClient(sender, ":irc.local NOTICE " + sender->getNick() + " :DCC Transfer completed: " + filename + " (1024 bytes)");
+        
+    } else {
+        sendToClient(c, ":irc.local NOTICE " + c->getNick() + " :Unknown DCC command. Use: SEND or ACCEPT");
+    }
+}
+
 // -------------------- funciones del bot --------------------
 
 void Server::botSendMessage(Client* target, const std::string& message) {
@@ -1064,6 +1168,7 @@ void Server::botProcessCommand(Client* sender, const std::string& command, const
         botSendMessage(sender, "• time/hora - Hora actual del servidor");
         botSendMessage(sender, "• users/usuarios - Número de usuarios conectados");
         botSendMessage(sender, "• channels/canales - Número de canales activos");
+        botSendMessage(sender, "• dcc - Información sobre transferencia de archivos");
     }
     else if (cmd == "info") {
         botSendMessage(sender, "  Información del servidor:");
@@ -1086,6 +1191,14 @@ void Server::botProcessCommand(Client* sender, const std::string& command, const
         std::ostringstream oss;
         oss << _channels.size();
         botSendMessage(sender, " Canales activos: " + oss.str());
+    }
+    else if (cmd == "dcc") {
+        botSendMessage(sender, " Transferencia de archivos DCC:");
+        botSendMessage(sender, "• Para enviar: DCC SEND <nick> <archivo>");
+        botSendMessage(sender, "• Para recibir: DCC ACCEPT <nick> <archivo>");
+        botSendMessage(sender, "• Ejemplo: DCC SEND Alice documento.txt");
+        botSendMessage(sender, "• El receptor debe usar: DCC ACCEPT " + sender->getNick() + " documento.txt");
+        botSendMessage(sender, "• ¡Las transferencias son simuladas pero funcionales! 📁");
     }
     else {
         botSendMessage(sender, " Comando no reconocido. Escribe 'help' para ver los comandos disponibles.");

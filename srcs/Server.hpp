@@ -42,6 +42,7 @@ private:
     void cmdMODE(Client* c, const std::vector<std::string>& params);
     void cmdKICK(Client* c, const std::vector<std::string>& params);
     void cmdINVITE(Client* c, const std::vector<std::string>& params);
+    void cmdDCC(Client* c, const std::vector<std::string>& params);
 
     // validaciones
     bool isValidNick(const std::string& nick);
