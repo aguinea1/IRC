@@ -33,9 +33,8 @@ bool Client::readFromSocket() {
             _bufferIn.append(buf, static_cast<size_t>(n));//guardar en socket
             if (_bufferIn.size() > 65536) return false;//puede dar overflow
         } else if (n == 0) {
-            // EOF (Ctrl+D) - limpiar buffer de entrada en lugar de desconectar
-            _bufferIn.clear();
-            return true; // mantener conexión activa
+            // EOF (Ctrl+D) - desconectar el cliente
+            return false; // cerrar conexión
         } else {
             if (errno == EWOULDBLOCK || errno == EAGAIN) break;//n <0 error
             return false;
